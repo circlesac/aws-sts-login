@@ -1,0 +1,15 @@
+#!/usr/bin/env node
+
+import { spawnSync } from "child_process";
+import { existsSync } from "fs";
+import { fileURLToPath } from "url";
+import path from "path";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const bin = path.join(__dirname, "native", "aws-sts-login");
+
+if (!existsSync(bin)) {
+  await import("./install.js");
+}
+const result = spawnSync(bin, process.argv.slice(2), { stdio: "inherit" });
+process.exit(result.status ?? 1);

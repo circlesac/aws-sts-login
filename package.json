@@ -1,0 +1,21 @@
+{
+  "name": "@circlesac/aws-sts-login",
+  "type": "module",
+  "description": "AWS Console auto-login CLI — captures STS temporary credentials via browser automation",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/circlesac/aws-sts-login"
+  },
+  "bin": {
+    "aws-sts-login": "bin/aws-sts-login.mjs"
+  },
+  "files": ["bin"],
+  "dependencies": {
+    "agent-browser": "^0.20.0",
+    "otpauth": "^9.5.0"
+  },
+  "scripts": {
+    "postinstall": "node bin/install.js"
+  }
+}
