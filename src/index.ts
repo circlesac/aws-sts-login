@@ -1,48 +1,81 @@
 import { execSync } from "child_process";
 import { homedir } from "os";
-import { readFileSync, writeFileSync, existsSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { join } from "path";
 import * as OTPAuth from "otpauth";
+
+// Parse INI-style config file
+function parseIni(content: string): Record<string, Record<string, string>> {
+  const result: Record<string, Record<string, string>> = {};
+  let currentSection = "";
+  for (const line of content.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#") || trimmed.startsWith(";")) continue;
+    const sectionMatch = trimmed.match(/^\[(.+)\]$/);
+    if (sectionMatch) {
+      currentSection = sectionMatch[1].trim();
+      result[currentSection] = result[currentSection] || {};
+      continue;
+    }
+    const kvMatch = trimmed.match(/^([^=]+?)\s*=\s*(.*)$/);
+    if (kvMatch && currentSection) {
+      result[currentSection][kvMatch[1].trim()] = kvMatch[2].trim();
+    }
+  }
+  return result;
+}
+
+// Load profiles from ~/.aws/sts-login
+const configPath = join(homedir(), ".aws", "sts-login");
+
+function loadProfiles(): Record<string, Record<string, string>> {
+  if (!existsSync(configPath)) return {};
+  return parseIni(readFileSync(configPath, "utf-8"));
+}
+
+const profiles = loadProfiles();
 
 // Profile from CLI arg: aws-sts-login aws-china-prd
 const profileArg = process.argv[2];
 if (!profileArg) {
   console.log("Usage: aws-sts-login <profile>\n");
-  console.log("Profiles configured in .env with prefix convention:");
-  console.log("  AWS_CHINA_PRD_ACCOUNT_ID, _USERNAME, _PASSWORD, _MFA_SECRET, _REGION\n");
-  const prefixes = new Set<string>();
-  for (const key of Object.keys(process.env)) {
-    const match = key.match(/^(.+)_ACCOUNT_ID$/);
-    if (match) prefixes.add(match[1]);
-  }
-  if (prefixes.size > 0) {
+  console.log(`Profiles configured in ${configPath}:\n`);
+  const names = Object.keys(profiles);
+  if (names.length > 0) {
     console.log("Available profiles:");
-    for (const p of prefixes) {
-      const name = p.toLowerCase().replace(/_/g, "-");
-      console.log(`  ${name}  (${process.env[`${p}_ACCOUNT_ID`]})`);
+    for (const name of names) {
+      console.log(`  ${name}  (${profiles[name].account_id || ""})`);
     }
+  } else {
+    console.log("No profiles found. Create ~/.aws/sts-login with:");
+    console.log("  [aws-china-prd]");
+    console.log("  account_id = 123456789012");
+    console.log("  username = myuser");
+    console.log("  password = mypass");
+    console.log("  mfa_secret = BASE32SECRET");
+    console.log("  region = cn-north-1");
   }
   process.exit(0);
 }
 
-// Convert profile name to env prefix: aws-china-prd → AWS_CHINA_PRD
-const envPrefix = profileArg.toUpperCase().replace(/-/g, "_");
-
-function env(suffix: string, required = true): string {
-  const val = process.env[`${envPrefix}_${suffix}`];
-  if (!val && required) {
-    console.error(`Missing env: ${envPrefix}_${suffix}`);
-    process.exit(1);
-  }
-  return val || "";
+const profile = profiles[profileArg];
+if (!profile) {
+  console.error(`Profile "${profileArg}" not found in ${configPath}`);
+  console.error(`Available: ${Object.keys(profiles).join(", ") || "(none)"}`);
+  process.exit(1);
 }
 
-const ACCOUNT_ID = env("ACCOUNT_ID");
-const USERNAME = env("USERNAME");
-const PASSWORD = env("PASSWORD");
-const MFA_SECRET = env("MFA_SECRET", false);
-const REGION = env("REGION", false) || "us-east-1";
+const ACCOUNT_ID = profile.account_id;
+const USERNAME = profile.username;
+const PASSWORD = profile.password;
+const MFA_SECRET = profile.mfa_secret || "";
+const REGION = profile.region || "us-east-1";
 const PROFILE = profileArg;
+
+if (!ACCOUNT_ID || !USERNAME || !PASSWORD) {
+  console.error(`Profile "${profileArg}" missing required fields (account_id, username, password)`);
+  process.exit(1);
+}
 
 const isChina = profileArg.includes("china");
 const DOMAIN = isChina ? "amazonaws.cn" : "aws.amazon.com";

@@ -4,3 +4,4 @@ bin/native
 *.tgz
 aws-sts-login
 *.bun-build
+.claude/settings.local.json

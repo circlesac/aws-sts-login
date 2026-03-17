@@ -24,18 +24,24 @@ Requires `agent-browser` (auto-installed via npm, or `npm install -g agent-brows
 
 ## Setup
 
-Copy `.env.example` to `.env` and fill in your credentials:
+Create `~/.aws/sts-login` with your login profiles:
 
-```bash
-# Profile: my-aws-dev → prefix: MY_AWS_DEV
-MY_AWS_DEV_ACCOUNT_ID=123456789012
-MY_AWS_DEV_USERNAME=myuser
-MY_AWS_DEV_PASSWORD=mypassword
-MY_AWS_DEV_MFA_SECRET=BASE32SECRET
-MY_AWS_DEV_REGION=us-east-1
+```ini
+[my-aws-dev]
+account_id = 123456789012
+username = myuser
+password = mypassword
+mfa_secret = BASE32SECRET
+region = us-east-1
 ```
 
-Profile naming: `my-aws-dev` → prefix `MY_AWS_DEV`
+See [sts-login.example](sts-login.example) for a full example.
+
+Set restrictive permissions:
+
+```sh
+chmod 600 ~/.aws/sts-login
+```
 
 ## Usage
 
@@ -50,4 +56,10 @@ Or run directly to write credentials to `~/.aws/credentials`:
 
 ```sh
 aws-sts-login my-aws-dev
+```
+
+List available profiles:
+
+```sh
+aws-sts-login
 ```

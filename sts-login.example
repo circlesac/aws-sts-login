@@ -1,0 +1,15 @@
+# ~/.aws/sts-login
+# Profile name = section name, used as: aws-sts-login <profile>
+
+[my-aws-dev]
+account_id = 123456789012
+username = myuser
+password = mypassword
+mfa_secret = BASE32SECRET
+region = us-east-1
+
+[my-aws-prod]
+account_id = 987654321098
+username = myuser
+password = mypassword
+region = ap-northeast-2
