@@ -106,7 +106,22 @@ function aws(cmd: string, env?: Record<string, string>): string {
   return execSync(fullCmd, { encoding: "utf-8", timeout: 30000, stdio: ["pipe", "pipe", "pipe"] }).trim();
 }
 
+function ensureConfigProfile() {
+  const configFile = join(homedir(), ".aws", "config");
+  const content = existsSync(configFile) ? readFileSync(configFile, "utf-8") : "";
+  const profileHeader = `[profile ${PROFILE}]`;
+  if (content.includes(profileHeader)) return;
+  const section = [
+    "",
+    profileHeader,
+    `region = ${REGION}`,
+    "",
+  ].join("\n");
+  writeFileSync(configFile, content.trimEnd() + "\n" + section);
+}
+
 function saveCredentials(stsCreds: any) {
+  ensureConfigProfile();
   let content = existsSync(credPath) ? readFileSync(credPath, "utf-8") : "";
   content = content.replace(new RegExp(`\\[${PROFILE}\\][\\s\\S]*?(?=\\n\\[|$)`, "g"), "").trim();
   const section = [
@@ -116,7 +131,6 @@ function saveCredentials(stsCreds: any) {
     `aws_access_key_id = ${stsCreds.AccessKeyId}`,
     `aws_secret_access_key = ${stsCreds.SecretAccessKey}`,
     `aws_session_token = ${stsCreds.SessionToken}`,
-    `region = ${REGION}`,
     `# expires: ${stsCreds.Expiration}`,
     "",
   ].join("\n");

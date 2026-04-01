@@ -1,17 +1,17 @@
 # aws-sts-login
 
-AWS Console auto-login CLI — captures STS temporary credentials via [agent-browser](https://agent-browser.dev/) and CDP.
+AWS Console auto-login CLI — logs in via browser automation, obtains STS temporary credentials, and writes them to `~/.aws/credentials`.
 
 ## Install
 
 ```sh
-npm install -g @circlesac/aws-sts-login
+brew install circlesac/tap/aws-sts-login
 ```
 
-Or with Homebrew:
+Or with npm:
 
 ```sh
-brew install circlesac/tap/aws-sts-login
+npm install -g @circlesac/aws-sts-login
 ```
 
 Or direct download:
@@ -19,8 +19,6 @@ Or direct download:
 ```sh
 curl -fsSL https://github.com/circlesac/aws-sts-login/releases/latest/download/install.sh | sh
 ```
-
-Requires `agent-browser` (auto-installed via npm, or `npm install -g agent-browser`).
 
 ## Setup
 
@@ -45,15 +43,6 @@ chmod 600 ~/.aws/sts-login
 
 ## Usage
 
-As `credential_process` in `~/.aws/config`:
-
-```ini
-[profile my-aws-dev]
-credential_process = env CREDENTIAL_PROCESS=true aws-sts-login my-aws-dev
-```
-
-Or run directly to write credentials to `~/.aws/credentials`:
-
 ```sh
 aws-sts-login my-aws-dev
 ```
@@ -63,3 +52,25 @@ List available profiles:
 ```sh
 aws-sts-login
 ```
+
+## How it works
+
+1. Opens a browser and logs into the AWS Console (username/password/MFA)
+2. Captures console session credentials via CDP
+3. Creates a temporary IAM Access Key using the console session
+4. Calls `sts get-session-token` with the Access Key + MFA to obtain proper STS credentials (12h TTL)
+5. Deletes the Access Key immediately
+6. Writes the STS credentials to `~/.aws/credentials` and creates a `~/.aws/config` profile if needed
+
+On subsequent runs, cached credentials are reused until they expire.
+
+## credential_process
+
+Can also be used as `credential_process` in `~/.aws/config`:
+
+```ini
+[profile my-aws-dev]
+credential_process = env CREDENTIAL_PROCESS=true aws-sts-login my-aws-dev
+```
+
+Note: This will open a browser window when credentials expire.
