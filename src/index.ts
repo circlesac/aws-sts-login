@@ -1,8 +1,9 @@
 import { defineCommand, runMain } from "citty";
 import { execSync } from "child_process";
 import { homedir } from "os";
-import { readFileSync, writeFileSync, existsSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, unlinkSync } from "fs";
 import { join } from "path";
+import { tmpdir } from "os";
 import * as OTPAuth from "otpauth";
 
 // Parse INI-style config file
@@ -26,6 +27,28 @@ function parseIni(content: string): Record<string, Record<string, string>> {
   return result;
 }
 
+function updateIniValue(filePath: string, section: string, key: string, value: string) {
+  let content = readFileSync(filePath, "utf-8");
+  const sectionHeader = `[${section}]`;
+  const sectionIdx = content.indexOf(sectionHeader);
+  if (sectionIdx === -1) throw new Error(`Section [${section}] not found in ${filePath}`);
+
+  const afterSection = content.indexOf("\n[", sectionIdx + sectionHeader.length);
+  const sectionEnd = afterSection === -1 ? content.length : afterSection;
+  const sectionContent = content.slice(sectionIdx, sectionEnd);
+
+  const keyRegex = new RegExp(`^${key}\\s*=.*$`, "m");
+  let newSectionContent;
+  if (keyRegex.test(sectionContent)) {
+    newSectionContent = sectionContent.replace(keyRegex, `${key} = ${value}`);
+  } else {
+    newSectionContent = sectionContent.trimEnd() + `\n${key} = ${value}\n`;
+  }
+
+  content = content.slice(0, sectionIdx) + newSectionContent + content.slice(sectionEnd);
+  writeFileSync(filePath, content);
+}
+
 const configPath = join(homedir(), ".aws", "sts-login");
 const credPath = join(homedir(), ".aws", "credentials");
 
@@ -36,6 +59,16 @@ function loadProfiles(): Record<string, Record<string, string>> {
 
 const profiles = loadProfiles();
 
+function profileDomains(profileName: string) {
+  const isChina = profileName.includes("china");
+  return {
+    isChina,
+    domain: isChina ? "amazonaws.cn" : "aws.amazon.com",
+    consoleDomain: isChina ? "console.amazonaws.cn" : "console.aws.amazon.com",
+    arnPrefix: isChina ? "aws-cn" : "aws",
+  };
+}
+
 function generateMFACode(secret: string): string {
   return new OTPAuth.TOTP({
     secret: OTPAuth.Secret.fromBase32(secret),
@@ -45,8 +78,16 @@ function generateMFACode(secret: string): string {
   }).generate();
 }
 
-function ab(cmd: string): string {
-  return execSync(`npx agent-browser ${cmd}`, { encoding: "utf-8", timeout: 30000, stdio: ["pipe", "pipe", "pipe"] }).trim();
+function ab(cmd: string, retries = 3): string {
+  for (let i = 0; i < retries; i++) {
+    try {
+      return execSync(`npx agent-browser ${cmd}`, { encoding: "utf-8", timeout: 60000, stdio: ["pipe", "pipe", "pipe"] }).trim();
+    } catch (err: any) {
+      if (i === retries - 1) throw err;
+      console.log(`[BROWSER] Retrying (${i + 1}/${retries})...`);
+    }
+  }
+  throw new Error("unreachable");
 }
 
 function sleep(ms: number) {
@@ -149,6 +190,150 @@ async function captureCredsViaCDP(consoleDomain: string): Promise<any> {
   });
 }
 
+async function browserLogin(opts: {
+  profileName: string;
+  accountId: string;
+  username: string;
+  password: string;
+  mfaSecret: string;
+  region: string;
+}): Promise<Record<string, string>> {
+  const { consoleDomain, domain } = profileDomains(opts.profileName);
+  const signinUrl = `https://${opts.accountId}.signin.${domain}/console`;
+
+  console.log(`[BROWSER] ${signinUrl} (${opts.username})`);
+  try { ab("close", 1); } catch {}
+  await sleep(2000);
+  try {
+    ab(`--headed open "${signinUrl}"`, 1);
+  } catch {
+    // Page may still be loading — wait and continue
+    await sleep(5000);
+  }
+
+  // Wait for login form to appear
+  let snapshot = "";
+  for (let i = 0; i < 10; i++) {
+    await sleep(2000);
+    try {
+      snapshot = ab("snapshot -i", 1);
+      if (snapshot.includes("username") || snapshot.includes("IAM user")) break;
+    } catch {}
+  }
+
+  if (snapshot.includes("username") || snapshot.includes("IAM user")) {
+    ab(`fill "#username" "${opts.username}"`);
+    ab(`fill "#password" "${opts.password}"`);
+    ab(`click "#signin_button"`);
+  }
+
+  if (opts.mfaSecret) {
+    await sleep(3000);
+    snapshot = ab("snapshot -i");
+
+    if (snapshot.includes("MFA") || snapshot.includes("mfacode") || snapshot.includes("mfaCode")) {
+      const code = generateMFACode(opts.mfaSecret);
+      console.log(`[BROWSER] MFA: ${code}`);
+
+      const mfaSel = snapshot.includes("mfacode") ? "#mfacode" : "[name='mfaCode']";
+      try {
+        ab(`fill "${mfaSel}" "${code}"`);
+      } catch {
+        ab(`fill "#mfacode" "${code}"`);
+      }
+
+      try {
+        ab('click "#submitMfa_button"');
+      } catch {
+        try { ab('click "button[type=submit]"'); } catch {}
+      }
+    }
+  }
+
+  // Wait for console
+  for (let i = 0; i < 20; i++) {
+    await sleep(3000);
+    try {
+      const url = ab("get url");
+      if (url.includes("/console/home") || url.includes("/console/")) break;
+    } catch {}
+  }
+
+  console.log("[BROWSER] Capturing console session...");
+  const consoleCreds = await captureCredsViaCDP(consoleDomain);
+
+  ab("close");
+
+  if (!consoleCreds) {
+    console.error("Failed to capture console credentials.");
+    process.exit(1);
+  }
+
+  return {
+    AWS_ACCESS_KEY_ID: consoleCreds.accessKeyId || consoleCreds.AccessKeyId,
+    AWS_SECRET_ACCESS_KEY: consoleCreds.secretAccessKey || consoleCreds.SecretAccessKey,
+    AWS_SESSION_TOKEN: consoleCreds.sessionToken || consoleCreds.SessionToken,
+  };
+}
+
+async function setupMfa(profileName: string, username: string, region: string, consoleEnv: Record<string, string>): Promise<string> {
+  const { arnPrefix } = profileDomains(profileName);
+  const mfaArn = `arn:${arnPrefix}:iam::${profiles[profileName].account_id}:mfa/${username}`;
+
+  // Remove existing MFA device if any
+  try {
+    const mfaDevices = JSON.parse(aws(`iam list-mfa-devices --user-name ${username} --region ${region} --output json`, consoleEnv));
+    for (const device of mfaDevices.MFADevices || []) {
+      console.log(`[MFA] Removing existing MFA device`);
+      aws(`iam deactivate-mfa-device --user-name ${username} --serial-number ${device.SerialNumber} --region ${region}`, consoleEnv);
+      aws(`iam delete-virtual-mfa-device --serial-number ${device.SerialNumber} --region ${region}`, consoleEnv);
+    }
+  } catch {}
+
+  // Clean up orphaned virtual MFA devices
+  try {
+    const allDevices = JSON.parse(aws(`iam list-virtual-mfa-devices --region ${region} --output json`, consoleEnv));
+    for (const device of allDevices.VirtualMFADevices || []) {
+      if (device.SerialNumber === mfaArn && !device.User) {
+        console.log(`[MFA] Removing orphaned virtual MFA device`);
+        aws(`iam delete-virtual-mfa-device --serial-number ${mfaArn} --region ${region}`, consoleEnv);
+      }
+    }
+  } catch {}
+
+  // Create virtual MFA device
+  const seedFile = join(tmpdir(), `mfa-seed-${Date.now()}`);
+  aws(`iam create-virtual-mfa-device --virtual-mfa-device-name ${username} --outfile ${seedFile} --bootstrap-method Base32StringSeed --region ${region} --output json`, consoleEnv);
+  const mfaSecret = readFileSync(seedFile, "utf-8").trim();
+  unlinkSync(seedFile);
+  console.log(`[MFA] Virtual MFA device created`);
+
+  // Generate two consecutive TOTP codes
+  console.log("[MFA] Waiting for TOTP window...");
+  const now = Math.floor(Date.now() / 1000);
+  const waitSecs = 30 - (now % 30) + 1;
+  await sleep(waitSecs * 1000);
+
+  const code1 = generateMFACode(mfaSecret);
+  console.log(`[MFA] Code 1: ${code1}`);
+  await sleep(30000);
+  const code2 = generateMFACode(mfaSecret);
+  console.log(`[MFA] Code 2: ${code2}`);
+
+  // Enable MFA device
+  aws(
+    `iam enable-mfa-device --user-name ${username} --serial-number ${mfaArn} --authentication-code1 ${code1} --authentication-code2 ${code2} --region ${region}`,
+    consoleEnv,
+  );
+  console.log(`[MFA] MFA enabled for ${username}`);
+
+  // Save to config
+  updateIniValue(configPath, profileName, "mfa_secret", mfaSecret);
+  console.log(`[MFA] mfa_secret saved to ${configPath}`);
+
+  return mfaSecret;
+}
+
 const main = defineCommand({
   meta: {
     name: "aws-sts-login",
@@ -167,7 +352,8 @@ const main = defineCommand({
       const names = Object.keys(profiles);
       if (names.length > 0) {
         for (const name of names) {
-          console.log(`  ${name}  (${profiles[name].account_id || ""})`);
+          const mfa = profiles[name].mfa_secret ? "MFA" : "no MFA";
+          console.log(`  ${name}  (${profiles[name].account_id || ""}) [${mfa}]`);
         }
       } else {
         console.log("No profiles found. Create ~/.aws/sts-login with:");
@@ -192,19 +378,15 @@ const main = defineCommand({
     const ACCOUNT_ID = profile.account_id;
     const USERNAME = profile.username;
     const PASSWORD = profile.password;
-    const MFA_SECRET = profile.mfa_secret || "";
+    let MFA_SECRET = profile.mfa_secret || "";
     const REGION = profile.region || "us-east-1";
+    const { arnPrefix } = profileDomains(profileName);
+    const mfaArn = `arn:${arnPrefix}:iam::${ACCOUNT_ID}:mfa/${USERNAME}`;
 
     if (!ACCOUNT_ID || !USERNAME || !PASSWORD) {
       console.error(`Profile "${profileName}" missing required fields (account_id, username, password)`);
       process.exit(1);
     }
-
-    const isChina = profileName.includes("china");
-    const DOMAIN = isChina ? "amazonaws.cn" : "aws.amazon.com";
-    const CONSOLE_DOMAIN = isChina ? "console.amazonaws.cn" : "console.aws.amazon.com";
-    const SIGNIN_URL = `https://${ACCOUNT_ID}.signin.${DOMAIN}/console`;
-    const mfaArn = `arn:${isChina ? "aws-cn" : "aws"}:iam::${ACCOUNT_ID}:mfa/${USERNAME}`;
 
     console.log(`[${profileName}] account:${ACCOUNT_ID} user:${USERNAME} region:${REGION}`);
 
@@ -221,67 +403,32 @@ const main = defineCommand({
       }
     }
 
-    // Browser login
-    console.log(`[BROWSER] ${SIGNIN_URL} (${USERNAME})`);
-    ab(`--headed open "${SIGNIN_URL}"`);
+    // Browser login (without MFA if not configured yet)
+    let consoleEnv = await browserLogin({
+      profileName,
+      accountId: ACCOUNT_ID,
+      username: USERNAME,
+      password: PASSWORD,
+      mfaSecret: MFA_SECRET,
+      region: REGION,
+    });
 
-    await sleep(2000);
-    let snapshot = ab("snapshot -i");
+    // Auto-setup MFA if not configured
+    if (!MFA_SECRET) {
+      console.log(`[MFA] No mfa_secret configured — setting up MFA automatically...`);
+      MFA_SECRET = await setupMfa(profileName, USERNAME, REGION, consoleEnv);
 
-    if (snapshot.includes("username") || snapshot.includes("IAM user")) {
-      ab(`fill "#username" "${USERNAME}"`);
-      ab(`fill "#password" "${PASSWORD}"`);
-      ab(`click "#signin_button"`);
+      // Re-login with MFA — console session needs MFA context for IAM operations
+      console.log(`[BROWSER] Re-logging in with MFA...`);
+      consoleEnv = await browserLogin({
+        profileName,
+        accountId: ACCOUNT_ID,
+        username: USERNAME,
+        password: PASSWORD,
+        mfaSecret: MFA_SECRET,
+        region: REGION,
+      });
     }
-
-    if (MFA_SECRET) {
-      await sleep(3000);
-      snapshot = ab("snapshot -i");
-
-      if (snapshot.includes("MFA") || snapshot.includes("mfacode") || snapshot.includes("mfaCode")) {
-        const code = generateMFACode(MFA_SECRET);
-        console.log(`[BROWSER] MFA: ${code}`);
-
-        const mfaSel = snapshot.includes("mfacode") ? "#mfacode" : "[name='mfaCode']";
-        try {
-          ab(`fill "${mfaSel}" "${code}"`);
-        } catch {
-          ab(`fill "#mfacode" "${code}"`);
-        }
-
-        try {
-          ab('click "#submitMfa_button"');
-        } catch {
-          try { ab('click "button[type=submit]"'); } catch {}
-        }
-      }
-    }
-
-    // Wait for console
-    for (let i = 0; i < 20; i++) {
-      await sleep(3000);
-      try {
-        const url = ab("get url");
-        if (url.includes("/console/home") || url.includes("/console/")) break;
-      } catch {}
-    }
-
-    // Capture console credentials via CDP
-    console.log("[BROWSER] Capturing console session...");
-    const consoleCreds = await captureCredsViaCDP(CONSOLE_DOMAIN);
-
-    ab("close");
-
-    if (!consoleCreds) {
-      console.error("Failed to capture console credentials.");
-      process.exit(1);
-    }
-
-    const consoleEnv: Record<string, string> = {
-      AWS_ACCESS_KEY_ID: consoleCreds.accessKeyId || consoleCreds.AccessKeyId,
-      AWS_SECRET_ACCESS_KEY: consoleCreds.secretAccessKey || consoleCreds.SecretAccessKey,
-      AWS_SESSION_TOKEN: consoleCreds.sessionToken || consoleCreds.SessionToken,
-    };
 
     // Create temporary access key (delete existing ones first to stay under limit)
     const listKeysOutput = aws(`iam list-access-keys --user-name ${USERNAME} --region ${REGION} --output json`, consoleEnv);
@@ -335,7 +482,6 @@ const main = defineCommand({
       aws(`iam delete-access-key --user-name ${USERNAME} --access-key-id ${newKey.AccessKeyId} --region ${REGION}`, stsEnv);
       console.log(`[IAM] Deleted access key ${newKey.AccessKeyId}`);
     } catch {
-      // Try with console creds if STS creds can't delete
       try {
         aws(`iam delete-access-key --user-name ${USERNAME} --access-key-id ${newKey.AccessKeyId} --region ${REGION}`, consoleEnv);
         console.log(`[IAM] Deleted access key ${newKey.AccessKeyId}`);
