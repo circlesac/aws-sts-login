@@ -13,6 +13,7 @@
   "files": ["bin"],
   "dependencies": {
     "agent-browser": "^0.20.0",
+    "citty": "^0.2.2",
     "otpauth": "^9.5.0"
   },
   "scripts": {
